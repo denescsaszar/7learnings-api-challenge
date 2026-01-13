@@ -27,12 +27,71 @@ def get_access_token(credentials: Credentials) -> str:
 
 # TODO: implement authentication and upload
 def upload_prices(credentials: Credentials, data: pd.DataFrame):
-    resp = requests.post(
-        f"{API}/import/prices/",
-        data.to_json(),
-        auth=HTTPBasicAuth(credentials.client_id, credentials.client_secret),
+    """
+    Upload prices to the API in batches, handling backpressure.
+    The API may accept fewer products than sent, so we retry remaining products.
+    """
+    # Get access token using our authentication function
+    access_token = get_access_token(credentials)
+    
+    # Group prices by product_id (CSV has multiple rows per product)
+    # This is like groupBy in JavaScript
+    products_data = []
+    for product_id, group in data.groupby('product_id'):
+        prices = []
+        for _, row in group.iterrows():
+            prices.append({
+                "market": row["market"],
+                "channel": row["channel"],
+                "price": float(row["price"]),
+                "valid_from": row["valid_from"],
+                "valid_until": row["valid_until"]
+            })
+        
+        products_data.append({
+            "product_id": int(product_id),
+            "prices": prices
+        })
+    
+    # Upload in batches (max 1000 products per request)
+    batch_size = 1000
+    uploaded_count = 0
+    
+    while uploaded_count < len(products_data):
+        batch = products_data[uploaded_count:uploaded_count + batch_size]
+        
+        response = requests.post(
+            f"{API}/product-prices",
+            json={"products": batch},
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        response.raise_for_status()
+        
+        num_imported = response.json()["num_imported"]
+        uploaded_count += num_imported
+        
+        print(f"Uploaded {num_imported} products (total: {uploaded_count}/{len(products_data)})")
+        
+        # If API didn't accept all products (backpressure), retry
+        if num_imported == 0:
+            print("API backpressure - retrying...")
+            continue
+    
+    print(f"\n✅ Successfully uploaded all {uploaded_count} products!")
+    
+    # Validate the upload
+    response = requests.get(
+        f"{API}/validate-product-prices",
+        headers={"Authorization": f"Bearer {access_token}"}
     )
-    resp.raise_for_status()
+    response.raise_for_status()
+    
+    validation_result = response.json()
+    
+    print("\n=== Validation Results ===")
+    print(f"Correct checksum: {validation_result['correct_checksum']}")
+    print(f"GCS Upload URL: {validation_result['gcs_upload']['url']}")
+    print(f"\n🎉 Challenge complete! Send the GCS URL to 7Learnings!")
 
 
 if __name__ == "__main__":
